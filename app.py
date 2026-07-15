@@ -24,6 +24,21 @@ STATUS_COLOR_NORMAL = "#333333"
 STATUS_COLOR_ERROR = "#cc0000"
 STATUS_COLOR_OK = "#006600"
 
+WEBP_QUALITY = 75
+VIDEO_EXTS = {".mp4", ".mov"}
+# Fallbacks for when the app is launched without Homebrew's bin dirs in PATH.
+CWEBP_FALLBACKS = ("/opt/homebrew/bin/cwebp", "/usr/local/bin/cwebp")
+
+
+def find_cwebp() -> str | None:
+    found = shutil.which("cwebp")
+    if found:
+        return found
+    for candidate in CWEBP_FALLBACKS:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
 
 def load_config() -> dict:
     try:
@@ -41,13 +56,13 @@ def save_config(data: dict) -> None:
 
 
 def next_capture_filename(folder: Path, kind: str) -> str:
-    """Next shared sequence: {SaveFolderName}_00001_pic.png or _00002_video.mov."""
+    """Next shared sequence: {SaveFolderName}_00001_pic.png or _00002_video.mp4."""
     prefix = folder.name or "capture"
-    ext = ".png" if kind == "pic" else ".mov"
+    ext = ".png" if kind == "pic" else ".mp4"
     suffix = kind  # "pic" or "video"
     patterns = [
-        re.compile(rf"^{re.escape(prefix)}_(\d{{5}})_(?:pic|video)\.(?:png|mov)$", re.I),
-        re.compile(rf"^{re.escape(prefix)}_(?:pic|vid)(\d{{5}})\.(?:png|mov)$", re.I),
+        re.compile(rf"^{re.escape(prefix)}_(\d{{5}})_(?:pic|video)\.(?:png|mov|mp4)$", re.I),
+        re.compile(rf"^{re.escape(prefix)}_(?:pic|vid)(\d{{5}})\.(?:png|mov|mp4)$", re.I),
     ]
     max_num = 0
     if folder.is_dir():
@@ -161,7 +176,7 @@ class CaptureHelper:
             try:
                 proc.stdin.write(command + "\n")
                 proc.stdin.flush()
-                line = self._readline(timeout=30, proc=proc)
+                line = self._readline(timeout=120, proc=proc)
             except OSError as exc:
                 return str(exc)
             except TimeoutError:
@@ -265,6 +280,13 @@ class IPhoneCaptureApp:
             refresh_row, text="Refresh", width=10, command=self._refresh_all
         )
         self.refresh_btn.pack(side=tk.LEFT)
+        self.webp_btn = tk.Button(
+            refresh_row,
+            text="Convert All to WebP",
+            width=18,
+            command=self._convert_to_webp,
+        )
+        self.webp_btn.pack(side=tk.RIGHT)
 
         status_frame = tk.Frame(frame)
         status_frame.pack(fill=tk.X, **pad)
@@ -434,8 +456,8 @@ class IPhoneCaptureApp:
         if not self.recording:
             return
         self._cancel_recording_timer()
-        filename = getattr(self, "_recording_filename", "recording.mov")
-        self._set_status("Stopping recording…")
+        filename = getattr(self, "_recording_filename", "recording.mp4")
+        self._set_status("Saving and compressing video…")
         self.record_btn.config(state=tk.DISABLED)
 
         def work() -> None:
@@ -455,6 +477,92 @@ class IPhoneCaptureApp:
                     self._set_status(f"Recording error: {err}", error=True)
                 else:
                     self._set_status(f"Recording saved: {filename}", ok=True)
+
+            self.root.after(0, ui_done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _convert_to_webp(self) -> None:
+        folder = Path(self.save_folder.get())
+        if not folder.is_dir():
+            self._set_status("Save folder does not exist yet — capture something first", error=True)
+            return
+        cwebp = find_cwebp()
+        if cwebp is None:
+            self._set_status("cwebp not found — install with: brew install webp", error=True)
+            return
+
+        pngs = sorted(
+            p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".png"
+        )
+        videos = sorted(
+            p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+        )
+        if not pngs and not videos:
+            self._set_status("No PNG or video files found in save folder", error=True)
+            return
+
+        dest_dir = folder.parent / f"{folder.name}_webp"
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"Cannot create output folder: {exc}", error=True)
+            return
+
+        self.webp_btn.config(state=tk.DISABLED)
+        self._set_status("Converting to WebP…")
+
+        def work() -> None:
+            converted = copied = skipped = 0
+            errors: list[str] = []
+            total = len(pngs)
+
+            for index, png in enumerate(pngs, start=1):
+                dest = dest_dir / f"{png.stem}.webp"
+                if dest.exists():
+                    skipped += 1
+                    continue
+                self.root.after(
+                    0,
+                    lambda i=index: self._set_status(f"Converting {i}/{total} to WebP…"),
+                )
+                result = subprocess.run(
+                    [cwebp, "-quiet", "-q", str(WEBP_QUALITY), str(png), "-o", str(dest)],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    converted += 1
+                else:
+                    errors.append(png.name)
+                    dest.unlink(missing_ok=True)
+
+            for video in videos:
+                dest = dest_dir / video.name
+                if dest.exists():
+                    skipped += 1
+                    continue
+                try:
+                    shutil.copy2(video, dest)
+                    copied += 1
+                except OSError:
+                    errors.append(video.name)
+
+            def ui_done() -> None:
+                self.webp_btn.config(state=tk.NORMAL)
+                if errors:
+                    self._set_status(
+                        f"WebP finished with errors — failed: {', '.join(errors[:3])}"
+                        + ("…" if len(errors) > 3 else ""),
+                        error=True,
+                    )
+                else:
+                    parts = [f"{converted} converted", f"{copied} videos copied"]
+                    if skipped:
+                        parts.append(f"{skipped} skipped")
+                    self._set_status(
+                        f"WebP done ({', '.join(parts)}) → {dest_dir.name}", ok=True
+                    )
 
             self.root.after(0, ui_done)
 

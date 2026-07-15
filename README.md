@@ -43,17 +43,28 @@ On first launch, click **Choose Folder…** to pick where captures are saved. Th
 | Screenshot | **Take Screenshot** button or **Spacebar** |
 | Record | **Start Recording** / **Stop Recording** |
 | Rescan device | **Refresh** |
+| Compress for web | **Convert All to WebP** |
 
 Wait for the status line to show `Ready — [Your Phone Name]` before capturing. The first scan can take a few seconds.
 
 ## File naming
 
-Captures use the save folder’s name with a shared incrementing counter:
+Captures use the save folder’s name with a shared incrementing counter. Videos are saved as H.264 MP4 at the original iPhone screen resolution, compressed and optimized for web playback when you stop recording.
 
 ```
 Lego Builder_00001_pic.png
-Lego Builder_00002_video.mov
+Lego Builder_00002_video.mp4
 Lego Builder_00003_pic.png
+```
+
+## Convert All to WebP
+
+Compresses the save folder for web publishing. Clicking **Convert All to WebP** creates a sibling folder named `[foldername]_webp`, converts every PNG to WebP at quality 75, and copies videos (`.mp4`/`.mov`) over unchanged. Originals are never modified. Re-running skips files already in the output folder, so you can capture more shots and convert again to pick up only the new ones.
+
+Requires the `cwebp` encoder:
+
+```bash
+brew install webp
 ```
 
 ## Project files

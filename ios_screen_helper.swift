@@ -5,7 +5,7 @@
  *
  * Commands:
  *   screenshot <path.png>
- *   record <path.mov>
+ *   record <path.mp4>
  *   stop
  *
  * Responses: ready:<name> | ok | recording | error:<message>
@@ -18,20 +18,23 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-final class ScreenCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
+final class ScreenCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate,
+    AVCaptureFileOutputRecordingDelegate
 {
     private let session = AVCaptureSession()
     private var device: AVCaptureDevice?
     private let videoOutput = AVCaptureVideoDataOutput()
+    private let movieOutput = AVCaptureMovieFileOutput()
     private let queue = DispatchQueue(label: "iphone-capture.frames")
     private var screenshotPath: String?
     private var screenshotDone: DispatchSemaphore?
     private var screenshotFailed = false
     private var latestSampleBuffer: CMSampleBuffer?
-    private var assetWriter: AVAssetWriter?
-    private var writerInput: AVAssetWriterInput?
-    private var recordingPath: String?
-    private var recordingActive = false
+    private var recordingFinalPath: String?
+    private var recordingTempPath: String?
+    private var isRecording = false
+    private var finishRecordingSem: DispatchSemaphore?
+    private var finishRecordingError: String?
 
     func start(device: AVCaptureDevice) throws {
         self.device = device
@@ -58,6 +61,13 @@ final class ScreenCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
         session.addOutput(videoOutput)
 
+        guard session.canAddOutput(movieOutput) else {
+            throw NSError(domain: "ScreenCapture", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Cannot add movie output",
+            ])
+        }
+        session.addOutput(movieOutput)
+
         session.commitConfiguration()
         session.startRunning()
 
@@ -66,14 +76,26 @@ final class ScreenCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     func stopSession() {
-        if recordingActive {
+        if isRecording {
             try? stopRecording()
         }
         session.stopRunning()
     }
 
+    private func storeLatestFrame(_ sampleBuffer: CMSampleBuffer) {
+        var copy: CMSampleBuffer?
+        CMSampleBufferCreateCopy(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sampleBuffer,
+            sampleBufferOut: &copy
+        )
+        if let copy {
+            latestSampleBuffer = copy
+        }
+    }
+
     func takeScreenshot(path: String) throws {
-        guard !recordingActive else {
+        guard !isRecording else {
             throw NSError(domain: "ScreenCapture", code: 4, userInfo: [
                 NSLocalizedDescriptionKey: "Cannot screenshot while recording",
             ])
@@ -120,76 +142,103 @@ final class ScreenCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     func startRecording(path: String) throws {
-        guard !recordingActive else { return }
-        let url = URL(fileURLWithPath: path)
-        try? FileManager.default.removeItem(at: url)
-        recordingPath = path
-        recordingActive = true
-        assetWriter = nil
-        writerInput = nil
+        guard !isRecording else { return }
+        guard let connection = movieOutput.connection(with: .video), connection.isActive else {
+            throw NSError(domain: "ScreenCapture", code: 13, userInfo: [
+                NSLocalizedDescriptionKey: "No active video connection for recording",
+            ])
+        }
+
+        let tempPath = path + ".recording.mov"
+        try? FileManager.default.removeItem(atPath: path)
+        try? FileManager.default.removeItem(atPath: tempPath)
+
+        recordingFinalPath = path
+        recordingTempPath = tempPath
+        isRecording = true
+        finishRecordingError = nil
+
+        movieOutput.startRecording(to: URL(fileURLWithPath: tempPath), recordingDelegate: self)
     }
 
     func stopRecording() throws {
-        guard recordingActive else { return }
-        recordingActive = false
-        var writeError: String?
+        guard isRecording else { return }
+        isRecording = false
 
-        queue.sync {
-            guard let writer = self.assetWriter else {
-                writeError = "No frames captured"
-                return
+        guard let finalPath = recordingFinalPath, let tempPath = recordingTempPath else { return }
+
+        let sem = DispatchSemaphore(value: 0)
+        finishRecordingSem = sem
+        finishRecordingError = nil
+        if movieOutput.isRecording {
+            movieOutput.stopRecording()
+            if sem.wait(timeout: .now() + 15) == .timedOut {
+                throw NSError(domain: "ScreenCapture", code: 6, userInfo: [
+                    NSLocalizedDescriptionKey: "Recording stop timed out",
+                ])
             }
-            self.writerInput?.markAsFinished()
-            let group = DispatchGroup()
-            group.enter()
-            writer.finishWriting {
-                if writer.status == .failed {
-                    writeError = writer.error?.localizedDescription ?? "Writer failed"
-                }
-                group.leave()
-            }
-            group.wait()
-            self.assetWriter = nil
-            self.writerInput = nil
+        } else {
+            // USB screen devices may clear isRecording before stop; finalize if possible.
+            movieOutput.stopRecording()
+            _ = sem.wait(timeout: .now() + 2)
         }
-
-        recordingPath = nil
-        if let writeError {
+        if let finishRecordingError {
             throw NSError(domain: "ScreenCapture", code: 7, userInfo: [
-                NSLocalizedDescriptionKey: writeError,
+                NSLocalizedDescriptionKey: finishRecordingError,
             ])
         }
-    }
 
-    private func startWriterIfNeeded(from sampleBuffer: CMSampleBuffer) {
-        guard recordingActive, assetWriter == nil, let path = recordingPath else { return }
-        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        defer {
+            recordingFinalPath = nil
+            recordingTempPath = nil
+            finishRecordingSem = nil
+        }
 
-        let width = CVPixelBufferGetWidth(imageBuffer)
-        let height = CVPixelBufferGetHeight(imageBuffer)
-        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: tempPath) else {
+            throw NSError(domain: "ScreenCapture", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "No recording file created — click Refresh and try again",
+            ])
+        }
+
+        let attrs = try? FileManager.default.attributesOfItem(atPath: tempPath)
+        let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        if size < 1024 {
+            try? FileManager.default.removeItem(atPath: tempPath)
+            throw NSError(domain: "ScreenCapture", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "Recording was empty — unlock iPhone and try again",
+            ])
+        }
 
         do {
-            let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-            let settings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: width,
-                AVVideoHeightKey: height,
-            ]
-            let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-            input.expectsMediaDataInRealTime = true
-            guard writer.canAdd(input) else { return }
-            writer.add(input)
-            guard writer.startWriting() else {
-                recordingActive = false
-                return
-            }
-            writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
-            assetWriter = writer
-            writerInput = input
+            try exportWebVideo(
+                from: URL(fileURLWithPath: tempPath),
+                to: URL(fileURLWithPath: finalPath)
+            )
         } catch {
-            recordingActive = false
+            throw NSError(domain: "ScreenCapture", code: 9, userInfo: [
+                NSLocalizedDescriptionKey: "Video export failed: \(error.localizedDescription)",
+            ])
         }
+
+        try? FileManager.default.removeItem(atPath: tempPath)
+    }
+
+    func fileOutput(
+        _ output: AVCaptureFileOutput,
+        didFinishRecordingTo outputFileURL: URL,
+        from connections: [AVCaptureConnection],
+        error: Error?
+    ) {
+        if let error = error as NSError? {
+            if error.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool == true {
+                finishRecordingError = nil
+            } else {
+                finishRecordingError = error.localizedDescription
+            }
+        } else {
+            finishRecordingError = nil
+        }
+        finishRecordingSem?.signal()
     }
 
     private func writePNG(from sampleBuffer: CMSampleBuffer, to path: String) -> Bool {
@@ -228,14 +277,7 @@ final class ScreenCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        latestSampleBuffer = sampleBuffer
-
-        if recordingActive {
-            startWriterIfNeeded(from: sampleBuffer)
-            if let input = writerInput, input.isReadyForMoreMediaData {
-                input.append(sampleBuffer)
-            }
-        }
+        storeLatestFrame(sampleBuffer)
 
         guard let path = screenshotPath else { return }
         let saved = writePNG(from: sampleBuffer, to: path)
@@ -245,6 +287,65 @@ final class ScreenCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         screenshotPath = nil
         screenshotDone?.signal()
         screenshotDone = nil
+    }
+}
+
+func videoRenderSize(for track: AVAssetTrack) -> CGSize {
+    let transformed = track.naturalSize.applying(track.preferredTransform)
+    return CGSize(width: abs(transformed.width), height: abs(transformed.height))
+}
+
+func exportWebVideo(from source: URL, to destination: URL) throws {
+    let asset = AVURLAsset(url: source)
+    guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+        throw NSError(domain: "ScreenCapture", code: 10, userInfo: [
+            NSLocalizedDescriptionKey: "No video track found in recording",
+        ])
+    }
+
+    let renderSize = videoRenderSize(for: videoTrack)
+    let composition = AVMutableVideoComposition()
+    composition.renderSize = renderSize
+    composition.frameDuration = CMTime(value: 1, timescale: 30)
+
+    let instruction = AVMutableVideoCompositionInstruction()
+    instruction.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+
+    let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+    layerInstruction.setTransform(videoTrack.preferredTransform, at: .zero)
+    instruction.layerInstructions = [layerInstruction]
+    composition.instructions = [instruction]
+
+    guard let exporter = AVAssetExportSession(
+        asset: asset,
+        presetName: AVAssetExportPresetHighestQuality
+    ) else {
+        throw NSError(domain: "ScreenCapture", code: 10, userInfo: [
+            NSLocalizedDescriptionKey: "Cannot create video exporter",
+        ])
+    }
+
+    try? FileManager.default.removeItem(at: destination)
+    exporter.outputURL = destination
+    exporter.outputFileType = .mp4
+    exporter.shouldOptimizeForNetworkUse = true
+    exporter.videoComposition = composition
+
+    let sem = DispatchSemaphore(value: 0)
+    var failed = false
+    var failureMessage = "Video export failed"
+    exporter.exportAsynchronously {
+        if exporter.status != .completed {
+            failed = true
+            failureMessage = exporter.error?.localizedDescription ?? failureMessage
+        }
+        sem.signal()
+    }
+    sem.wait()
+    if failed {
+        throw NSError(domain: "ScreenCapture", code: 11, userInfo: [
+            NSLocalizedDescriptionKey: failureMessage,
+        ])
     }
 }
 
